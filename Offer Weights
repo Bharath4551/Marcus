@@ -1,0 +1,185 @@
+Reduce weight for offers seen 5 or more times
+
+var SEEN_LIMIT = 5;
+var WEIGHT_REDUCED = 1;
+var LOG_UPDATE_BATCHSIZE = 50;
+var STATUS_SEEN = 0;
+var STATUS_SEEN_PROCESSED = 10;
+
+var propositions = xtk.queryDef.create(
+  <queryDef operation="select" schema="mcs:propositionRcp">
+    <select>
+      <node expr="[@recipientOffer-id]" alias="@recipientOfferId" groupBy="1"/>
+      <node expr="[@offer-id]" alias="@offerId" groupBy="1"/>
+      <node expr="[offer/@name]" alias="@name" groupBy="1"/>
+    </select>
+    <having>
+      <condition expr={'count([@offer-id]) >= ' + SEEN_LIMIT}/>
+    </having>
+    <where>
+      <condition expr={'@status = ' + STATUS_SEEN}/>
+    </where>
+  </queryDef>).ExecuteQuery();
+
+var recipientOffers = [];
+for each (var proposition in propositions) {
+  var offerNumber = (proposition.@name + '').replace(/\D/g, '');
+  var recipientOffer = <recipientOffer xtkschema="mcs:recipientOffer"
+    _operation="update" id={proposition.@recipientOfferId}>
+    <eligibility/>
+  </recipientOffer>;
+  recipientOffer.eligibility['@offer' + offerNumber] = WEIGHT_REDUCED;
+  xtk.session.Write(recipientOffer);
+  recipientOffers.push([
+    proposition.@recipientOfferId,
+    proposition.@offerId,
+  ]);
+}
+
+if (recipientOffers.length) {
+  logInfo('Marking logs for ' + recipientOffers.length + ' reduced weight offers ...');
+  for (var i=0,il=recipientOffers.length; i<il; i+=LOG_UPDATE_BATCHSIZE) {
+    xtk.builder.ExecSql(
+      'default',
+      'UPDATE McsPropositionRcp SET iStatus = ' + STATUS_SEEN_PROCESSED +
+        ' WHERE iStatus = 0 AND (' + recipientOffers.slice(i, i + LOG_UPDATE_BATCHSIZE).map(function(_){
+          return 'iRecipientOfferId=' + _[0] + ' AND iOfferId=' + _[1];
+        }).join(' OR ') + ')'
+    );
+  }
+}
+
+
+
+
+
+
+
+
+Reset all weights if all weights have been reduced
+
+
+var WEIGHT_REDUCED = 1;
+var WEIGHT_RESET = 10;
+var DIR_ROOT_OFFERS_LIVE = '/MARCUS/Offers - Live/';
+
+var offers = [];
+var nmsOffers = xtk.queryDef.create(
+  <queryDef operation="select" schema="nms:offer">
+    <select>
+      <node expr="@name"/>
+    </select>
+    <where>
+      <condition expr={"[category/@fullName] LIKE '" + DIR_ROOT_OFFERS_LIVE + "%'"}/>
+    </where>
+  </queryDef>).ExecuteQuery();
+for each (var nmsOffer in nmsOffers) {
+  var offer = (nmsOffer.@name + '').replace(/\D/g, '');
+  if (offer) offers.push('iOffer' + offer);
+}
+
+if (offers.length) {
+  xtk.builder.ExecSql(
+    'default',
+    'UPDATE McsRecipientOffer SET ' + offers.map(function(_){
+      return _ + '=CASE ' + _ + ' WHEN 0 THEN 0 ELSE ' + WEIGHT_RESET + ' END';
+    }).join(',') +
+    ' WHERE ' + offers.map(function(_){
+      return _ + ' in(0,' + WEIGHT_REDUCED + ')';
+    }).join(' AND ')
+  );
+}
+
+
+
+
+
+
+Mark new rejected offers as ineligible
+
+var STATUS_REJECTED = 5;
+var WEIGHT_DISABLED = 255;
+
+var lastRun = getOption('lastRun_mcsSetRejectedOffers');
+if (!lastRun) {
+  logWarning('Please set xtk:option lastRun_mcsSetRejectedOffers')
+  lastRun = new Date(0);
+}
+
+var propositions = xtk.queryDef.create(
+  <queryDef operation="select" schema="mcs:propositionRcp">
+    <select>
+      <node expr="[@recipientOffer-id]" alias="@recipientOfferId"/>
+      <node expr="[offer/@name]" alias="@name"/>
+    </select>
+    <where>
+      <condition boolOperator="AND" expr={'@status = ' + STATUS_REJECTED}/>
+      <condition expr={'@lastModified >= "' + formatDate(lastRun, "%4Y/%2M/%2D %02H:%02N:%02S") + '"'}/>
+    </where>
+  </queryDef>).ExecuteQuery();
+var now = new Date();
+
+var offerCount = 0;
+for each (var proposition in propositions) {
+  var offerNumber = (proposition.@name + '').replace(/\D/g, '');
+  var recipientOffer = <recipientOffer xtkschema="mcs:recipientOffer"
+    _operation="update" id={proposition.@recipientOfferId}>
+    <eligibility/>
+  </recipientOffer>;
+  recipientOffer.eligibility['@offer' + offerNumber] = WEIGHT_DISABLED;
+  xtk.session.Write(recipientOffer);
+  offerCount++;
+}
+if (offerCount) logInfo('Marked ' + offerCount + ' ineligible ...');
+
+setOption('lastRun_mcsSetRejectedOffers', now);
+
+
+
+
+
+
+
+
+
+
+Mark old rejected offers as eligible again
+
+var DAYS_AGO = 7;
+var WEIGHT_ENABLED = 10;
+var STATUS_REJECTED = 5;
+
+var lastRun = getOption('lastRun_mcsUnsetRejectedOffers');
+if (!lastRun) {
+  logWarning('Please set xtk:option lastRun_mcsUnsetRejectedOffers')
+  lastRun = new Date(0);
+}
+
+var daysAgoMax = DAYS_AGO + Math.ceil((new Date() - new Date(lastRun))/(86400 * 1000));
+
+var propositionSql =
+  'SELECT P0.iRecipientOfferId, O1.sName ' +
+  'FROM McsPropositionRcp P0 JOIN NmsOffer O1 ON (O1.iOfferId = P0.iOfferId) ' +
+  'WHERE P0.tsLastModified >= $(pfx)Adddays($(curdate),-' + daysAgoMax + ') AND ' +
+  'P0.tsLastModified < $(pfx)Adddays($(curdate),-' + DAYS_AGO + ') AND ' +
+  'iStatus = ' + STATUS_REJECTED + ' AND P0.iRecipientOfferId NOT IN (' +
+  'SELECT iPropositionId FROM McsPropositionRcp ' +
+  'WHERE iStatus <> ' + STATUS_REJECTED + ' AND tsLastModified >= $(pfx)Adddays($(curdate),-' + DAYS_AGO + '))';
+
+var rows = application.getConnection().query(propositionSql);
+var now = new Date();
+
+var offerCount = 0;
+for each (var row in rows) {
+logInfo(row.join(' '));
+  var offerNumber = row[1].replace(/\D/g, '');
+  var recipientOffer = <recipientOffer xtkschema="mcs:recipientOffer" _operation="update" id={row[0]}>
+    <eligibility/>
+  </recipientOffer>;
+  recipientOffer.eligibility['@offer' + offerNumber] = WEIGHT_ENABLED;
+  xtk.session.Write(recipientOffer);
+  offerCount++;
+}
+if (offerCount) logInfo('Marked ' + offerCount + ' re-eligible ...');
+
+setOption('lastRun_mcsUnsetRejectedOffers', now);
